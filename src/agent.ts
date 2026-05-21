@@ -53,6 +53,8 @@ export class Agent {
   private apiCredentials: { key?: string; baseUrl?: string }
   private provider: LLMProvider
   private mcpLinks: MCPConnection[] = []
+  /** Snapshot of all MCP servers attached during setup, surfaced on `system.init`. */
+  private mcpServerStatus: Array<{ name: string; status: string }> = []
   private history: NormalizedMessageParam[] = []
   private messageLog: Message[] = []
   private setupDone: Promise<void>
@@ -200,10 +202,12 @@ export class Agent {
           if (isSdkServerConfig(config)) {
             // In-process SDK MCP server - directly add tools
             this.toolPool = [...this.toolPool, ...config.tools]
+            this.mcpServerStatus.push({ name, status: 'connected' })
           } else {
             // External MCP server
             const connection = await connectMCPServer(name, config)
             this.mcpLinks.push(connection)
+            this.mcpServerStatus.push({ name, status: connection.status })
 
             if (connection.status === 'connected' && connection.tools.length > 0) {
               this.toolPool = [...this.toolPool, ...connection.tools]
@@ -211,6 +215,7 @@ export class Agent {
           }
         } catch (err: any) {
           console.error(`[MCP] Failed to connect to "${name}": ${err.message}`)
+          this.mcpServerStatus.push({ name, status: 'error' })
         }
       }
     }
@@ -311,6 +316,8 @@ export class Agent {
       agents: opts.agents,
       hookRegistry: this.hookRegistry,
       sessionId: this.sid,
+      mcpServersInit: this.mcpServerStatus,
+      permissionMode: permMode,
     })
     this.currentEngine = engine
 

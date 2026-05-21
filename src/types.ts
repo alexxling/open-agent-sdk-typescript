@@ -496,4 +496,16 @@ export interface QueryEngineConfig {
   hookRegistry?: import('./hooks.js').HookRegistry
   /** Session ID for hook context */
   sessionId?: string
+  /**
+   * MCP servers (in-process SDK + external stdio/sse/http) that the caller has
+   * already attached to this engine's tool pool. Surfaced verbatim on the
+   * `system.init` event so downstream code can audit which servers connected.
+   */
+  mcpServersInit?: Array<{ name: string; status: string }>
+  /**
+   * Permission mode resolved by the caller (Agent layer). Surfaced on the
+   * `system.init` event. Defaults to 'bypassPermissions' when omitted to
+   * match historical behavior.
+   */
+  permissionMode?: PermissionMode
 }

@@ -314,8 +314,8 @@ export class QueryEngine {
       tools: this.config.tools.map(t => t.name),
       model: this.config.model,
       cwd: this.config.cwd,
-      mcp_servers: [],
-      permission_mode: 'bypassPermissions',
+      mcp_servers: this.config.mcpServersInit ?? [],
+      permission_mode: this.config.permissionMode ?? 'bypassPermissions',
     } as SDKMessage
 
     // Agentic loop
