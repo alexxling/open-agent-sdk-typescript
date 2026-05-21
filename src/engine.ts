@@ -234,6 +234,8 @@ export class QueryEngine {
   private sessionId: string
   private apiTimeMs = 0
   private hookRegistry?: HookRegistry
+  /** Audit trail of canUseTool denials in this run; surfaced via SDKResultMessage.permission_denials. */
+  private permissionDenials: Array<{ tool: string; reason: string }> = []
 
   constructor(config: QueryEngineConfig) {
     this.config = config
@@ -288,6 +290,9 @@ export class QueryEngine {
         num_turns: 0,
         cost: 0,
         errors: ['Blocked by UserPromptSubmit hook'],
+        ...(this.permissionDenials.length > 0
+          ? { permission_denials: this.permissionDenials }
+          : {}),
       }
       return
     }
@@ -412,6 +417,9 @@ export class QueryEngine {
           usage: this.totalUsage,
           num_turns: this.turnCount,
           cost: this.totalCost,
+          ...(this.permissionDenials.length > 0
+            ? { permission_denials: this.permissionDenials }
+            : {}),
         }
         return
       }
@@ -549,6 +557,9 @@ export class QueryEngine {
       model_usage: { [this.config.model]: { input_tokens: this.totalUsage.input_tokens, output_tokens: this.totalUsage.output_tokens } },
       cost: this.totalCost,
       structured_output: structuredOutput,
+      ...(this.permissionDenials.length > 0
+        ? { permission_denials: this.permissionDenials }
+        : {}),
     }
   }
 
@@ -639,28 +650,56 @@ export class QueryEngine {
 
     // Check permissions
     if (this.config.canUseTool) {
+      // Hook: PermissionRequest — fire BEFORE the check, regardless of outcome.
+      // Failures inside hooks are swallowed by executeHooks so the main flow
+      // is never affected by an observer that throws.
+      await this.executeHooks('PermissionRequest', {
+        toolName: block.name,
+        toolInput: block.input,
+        toolUseId: block.id,
+      })
+
+      let permission: import('./types.js').CanUseToolResult
       try {
-        const permission = await this.config.canUseTool(tool, block.input)
-        if (permission.behavior === 'deny') {
-          return {
-            type: 'tool_result',
-            tool_use_id: block.id,
-            content: permission.message || `Permission denied for tool "${block.name}"`,
-            is_error: true,
-            tool_name: block.name,
-          }
-        }
-        if (permission.updatedInput !== undefined) {
-          block = { ...block, input: permission.updatedInput }
-        }
+        permission = await this.config.canUseTool(tool, block.input)
       } catch (err: any) {
+        const reason = `Permission check error: ${err?.message ?? String(err)}`
+        this.permissionDenials.push({ tool: block.name, reason })
+        await this.executeHooks('PermissionDenied', {
+          toolName: block.name,
+          toolInput: block.input,
+          toolUseId: block.id,
+          error: reason,
+        })
         return {
           type: 'tool_result',
           tool_use_id: block.id,
-          content: `Permission check error: ${err.message}`,
+          content: reason,
           is_error: true,
           tool_name: block.name,
         }
+      }
+
+      if (permission.behavior === 'deny') {
+        const reason = permission.message || `Permission denied for tool "${block.name}"`
+        this.permissionDenials.push({ tool: block.name, reason })
+        await this.executeHooks('PermissionDenied', {
+          toolName: block.name,
+          toolInput: block.input,
+          toolUseId: block.id,
+          error: reason,
+        })
+        return {
+          type: 'tool_result',
+          tool_use_id: block.id,
+          content: reason,
+          is_error: true,
+          tool_name: block.name,
+        }
+      }
+
+      if (permission.updatedInput !== undefined) {
+        block = { ...block, input: permission.updatedInput }
       }
     }
 

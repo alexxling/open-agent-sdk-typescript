@@ -283,6 +283,35 @@ for await (const msg of query({
 }
 ```
 
+When you supply a custom `canUseTool` callback, every denial (`{ behavior: 'deny' }` or a thrown error inside the callback) is recorded for the run. The denied tool call is still returned to the model as an `is_error: true` tool result so the model can self-correct, and the aggregated audit trail is exposed on the final `SDKResultMessage`:
+
+```typescript
+for await (const msg of query({
+  prompt: "Read ./README.md and summarize it.",
+  options: {
+    allowedTools: ["Read"],
+    canUseTool: async (tool) => ({
+      behavior: "deny",
+      message: `denied: ${tool.name}`,
+    }),
+  },
+})) {
+  if (msg.type === "result") {
+    // permission_denials is only present when at least one denial occurred.
+    // Shape: Array<{ tool: string; reason: string }>
+    console.log(msg.permission_denials);
+    // → [ { tool: 'Read', reason: 'denied: Read' } ]
+  }
+}
+```
+
+The same flow also fires two lifecycle hook events:
+
+- `PermissionRequest` — fired before every `canUseTool` call (allow or deny).
+- `PermissionDenied` — fired whenever `canUseTool` returns `deny` or throws.
+
+Both receive `{ toolName, toolInput, toolUseId }` (plus `error` on denial) so observers can build their own audit logs.
+
 ### Web UI
 
 A built-in web chat interface is included for testing:

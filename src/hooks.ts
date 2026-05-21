@@ -14,7 +14,8 @@
  * - SubagentStart: subagent spawned
  * - SubagentStop: subagent completed
  * - UserPromptSubmit: user sends message
- * - PermissionRequest: permission check triggered
+ * - PermissionRequest: permission check triggered (fired before canUseTool, regardless of outcome)
+ * - PermissionDenied: fired when canUseTool denies or throws
  * - TaskCreated: task created
  * - TaskCompleted: task finished
  * - ConfigChange: settings changed
