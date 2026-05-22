@@ -50,11 +50,42 @@ import type { HookRegistry, HookInput, HookOutput } from './hooks.js'
 // Tool format conversion
 // ============================================================================
 
+/**
+ * Resolve a tool's full LLM-facing description.
+ *
+ * If the tool exposes a `prompt(ctx)` callback (typically populated by
+ * `defineTool({ prompt })`), we await it and append the dynamic part to the
+ * static `description`. This is the single place where dynamic per-turn tool
+ * descriptions get materialized — every other consumer (system prompt list,
+ * provider tools array) routes through here so the LLM sees the same string.
+ *
+ * Falsy / empty / duplicate output is dropped so callers can no-op safely.
+ */
+async function resolveToolDescription(
+  tool: ToolDefinition,
+  ctx: ToolContext,
+): Promise<string> {
+  if (!tool.prompt) return tool.description
+  let dynamic: string
+  try {
+    dynamic = await tool.prompt(ctx)
+  } catch {
+    // A throwing prompt() must never break the agent loop — fall back to the
+    // static description so the LLM still sees a sane tool description.
+    return tool.description
+  }
+  if (!dynamic || dynamic === tool.description) return tool.description
+  return `${tool.description}\n\n${dynamic}`
+}
+
 /** Convert a ToolDefinition to the normalized provider tool format. */
-function toProviderTool(tool: ToolDefinition): NormalizedTool {
+async function toProviderTool(
+  tool: ToolDefinition,
+  ctx: ToolContext,
+): Promise<NormalizedTool> {
   return {
     name: tool.name,
-    description: tool.description,
+    description: await resolveToolDescription(tool, ctx),
     input_schema: tool.inputSchema,
   }
 }
@@ -145,7 +176,10 @@ function buildStructuredOutputBlock(config: QueryEngineConfig): string | undefin
   )
 }
 
-async function buildSystemPrompt(config: QueryEngineConfig): Promise<string> {
+async function buildSystemPrompt(
+  config: QueryEngineConfig,
+  ctx: ToolContext,
+): Promise<string> {
   const structuredBlock = buildStructuredOutputBlock(config)
 
   if (config.systemPrompt) {
@@ -166,11 +200,17 @@ async function buildSystemPrompt(config: QueryEngineConfig): Promise<string> {
     'You should use tools when they would help you complete the task more accurately or efficiently.',
   )
 
-  // List available tools with descriptions
+  // List available tools with descriptions. Routes through resolveToolDescription
+  // so any tool that exposes prompt(ctx) gets its dynamic suffix injected here
+  // exactly the same way toProviderTool injects it into the API tools array.
   parts.push('\n# Available Tools\n')
-  for (const tool of config.tools) {
-    parts.push(`- **${tool.name}**: ${tool.description}`)
-  }
+  const toolDescriptions = await Promise.all(
+    config.tools.map(async (tool) => {
+      const fullDesc = await resolveToolDescription(tool, ctx)
+      return `- **${tool.name}**: ${fullDesc}`
+    }),
+  )
+  for (const line of toolDescriptions) parts.push(line)
 
   // Add agent definitions
   if (config.agents && Object.keys(config.agents).length > 0) {
@@ -300,11 +340,25 @@ export class QueryEngine {
     // Add user message
     this.messages.push({ role: 'user', content: prompt as any })
 
-    // Build tool definitions for provider
-    const tools = this.config.tools.map(toProviderTool)
+    // Build a ToolContext used purely for resolving tool descriptions on this
+    // submitMessage invocation. The per-call ctx (with abortSignal) is built
+    // separately inside executeTools — keeping these two contexts isolated
+    // prevents a tool's prompt() callback from accidentally observing the
+    // abort signal and treating it as cancellation.
+    const promptCtx: ToolContext = {
+      cwd: this.config.cwd,
+      provider: this.provider,
+      model: this.config.model,
+      apiType: this.provider.apiType,
+    }
+
+    // Build tool definitions for provider (resolves prompt(ctx) per tool)
+    const tools = await Promise.all(
+      this.config.tools.map((t) => toProviderTool(t, promptCtx)),
+    )
 
     // Build system prompt
-    const systemPrompt = await buildSystemPrompt(this.config)
+    const systemPrompt = await buildSystemPrompt(this.config, promptCtx)
 
     // Emit init system message
     yield {
@@ -584,13 +638,26 @@ export class QueryEngine {
       process.env.AGENT_SDK_MAX_TOOL_CONCURRENCY || '10',
     )
 
-    // Partition into read-only (concurrent) and mutation (serial)
+    // Partition into read-only (concurrent) and mutation (serial).
+    //
+    // A tool qualifies for the concurrent bucket only if BOTH:
+    //   1. isReadOnly() === true      (won't mutate external state)
+    //   2. isConcurrencySafe() !== false  (safe to invoke in parallel)
+    //
+    // The `!== false` form preserves historical behaviour: tools that never
+    // declared isConcurrencySafe (every built-in pre-fix, and any caller code
+    // that omitted it) keep parallelizing. Only an explicit
+    // `isConcurrencySafe: false` opts the tool out of the parallel batch —
+    // matching the "read-only but stateful / rate-limited / order-sensitive"
+    // case that this hint was always meant to express.
     const readOnly: Array<{ block: ToolUseBlock; tool?: ToolDefinition }> = []
     const mutations: Array<{ block: ToolUseBlock; tool?: ToolDefinition }> = []
 
     for (const block of toolUseBlocks) {
       const tool = this.config.tools.find((t) => t.name === block.name)
-      if (tool?.isReadOnly?.()) {
+      const readOnlyHint = tool?.isReadOnly?.() === true
+      const concurrencyOk = tool?.isConcurrencySafe?.() !== false
+      if (readOnlyHint && concurrencyOk) {
         readOnly.push({ block, tool })
       } else {
         mutations.push({ block, tool })
